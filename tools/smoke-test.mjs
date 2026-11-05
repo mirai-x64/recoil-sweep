@@ -60,7 +60,7 @@ try {
     '--remote-debugging-port=' + port,
     '--user-data-dir=' + profile,
     '--no-first-run', '--no-default-browser-check', '--no-sandbox',
-    '--disable-gpu', '--window-size=900,620',
+    '--disable-gpu', '--window-size=460,480',
     'about:blank'
   ], { stdio: 'ignore' });
 
@@ -110,7 +110,7 @@ try {
   console.log('real-input thrust test: vx=' + dReal.player.vx.toFixed(2) + ' vy=' + dReal.player.vy.toFixed(2), realInputMoved ? 'OK' : 'NG');
 
   // --- 決定的な口 __test を使って、拾う→運ぶ→納品(スコア加算)→投げる反動、を検証 ---
-  const AIRLOCK_X = 60, AIRLOCK_Y = 280;
+  const AIRLOCK_X = 60, AIRLOCK_Y = 210;
   let sawPickup = false, sawDeposit = false, sawThrowRecoil = false;
   let prevHeld = 0, prevScore = 0;
 
@@ -125,8 +125,8 @@ try {
     } else {
       tx = AIRLOCK_X; ty = AIRLOCK_Y;
     }
-    tx = Math.max(0, Math.min(899, tx));
-    ty = Math.max(0, Math.min(559, ty));
+    tx = Math.max(0, Math.min(459, tx));
+    ty = Math.max(0, Math.min(419, ty));
     await evalJs(`window.__test.setAim(${tx},${ty})`);
     await evalJs('window.__test.setThrust(true)');
     if (d.held > prevHeld) sawPickup = true;
@@ -143,8 +143,8 @@ try {
   for (let i=0;i<200 && prevHeld === 0;i++){ // 拾うまで最大30s
     const d = await getDebug();
     const angle = (i * 0.31) % (Math.PI*2);
-    const tx = Math.max(0, Math.min(899, d.player.x + Math.cos(angle)*260));
-    const ty = Math.max(0, Math.min(559, d.player.y + Math.sin(angle)*260));
+    const tx = Math.max(0, Math.min(459, d.player.x + Math.cos(angle)*160));
+    const ty = Math.max(0, Math.min(419, d.player.y + Math.sin(angle)*160));
     await evalJs(`window.__test.setAim(${tx},${ty})`);
     await evalJs('window.__test.setThrust(true)');
     prevHeld = d.held;
