@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>recoil-sweep — 無重力デブリ回収</title>
+<style>
+  html,body{margin:0;padding:0;background:#05070d;overflow:hidden;}
+  canvas{display:block;background:#05070d;cursor:crosshair;}
+  #hint{
+    position:absolute;left:0;top:0;width:900px;text-align:center;
+    color:#7f93b0;font:13px monospace;padding-top:4px;pointer-events:none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c" width="900" height="560"></canvas>
+<div id="hint">マウス=照準　Space=投げる(反動で動く)　C=姿勢制御(弱)/スラスタ(解放後は強)</div>
+<script>
+(function(){
+"use strict";
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = canvas.width, H = canvas.height;
+
+// ---- 定数 ----
+var WALL_X = 100;
+var AIRLOCK_Y0 = 230, AIRLOCK_Y1 = 330;
+var PLAYER_R = 14, PLAYER_MASS = 6;
+var THROW_IMPULSE = 60;
+var WALL_REST = 0.55; // 外周の反発係数
+var BASE_RCS_ACCEL = 25; // 何も持たなくても使える弱い姿勢制御。解放前の詰み防止
+var THRUSTER_ACCEL = 140;
+var FUEL_MAX = 100, FUEL_DRAIN = 40, FUEL_REGEN = 12;
+var MAGNET_RADIUS = 170, MAGNET_ACCEL = 90;
+var MAX_DEBRIS = 16, SPAWN_INTERVAL = 4.5;
+var INITIAL_DEBRIS = 12;
+
+var UNLOCK_CAP2 = 5;
+var UNLOCK_THRUSTER = 12;
+var UNLOCK_MAGNET = 22;
+
+var TYPES = [
+  {key:'small',  mass:1.0, r:9,  color:'#8fd3ff', value:1},
+  {key:'medium', mass:2.0, r:15, color:'#ffd38f', value:2},
+  {key:'large',  mass:3.2, r:21, color:'#ff8f8f', value:3}
+];
+
+// ---- 状態 ----
+var player = {x: WALL_X + 60, y: H/2, vx:0, vy:0};
+var held = [];       // [{mass,r,color,value,key}]
+var capacity = 1;
+var debrisList = []; // [{x,y,vx,vy,mass,r,color,value,key}]
+var score = 0;
+var unlocks = {cap2:false, thruster:false, magnet:false};
+var fuel = 0;
+var spawnTimer = SPAWN_INTERVAL;
+var mouse = {x: player.x+100, y: player.y};
+var keys = {c:false};
+var toast = {text:'', t:0};
+var stars = [];
+
+for (var i=0;i<90;i++){
+  stars.push({x: Math.random()*W, y: Math.random()*H, r: Math.random()*1.4+0.3});
+}
+
+function randType(){
+  return TYPES[Math.floor(Math.random()*TYPES.length)];
+}
+
+function spawnDebris(){
+  var t = randType();
+  var x, y, tries = 0;
+  do {
+    x = WALL_X + 60 + Math.random()*(W - WALL_X - 100);
+    y = 30 + Math.random()*(H-60);
+    tries++;
+  } while (dist(x,y,player.x,player.y) < 80 && tries < 10);
+  var ang = Math.random()*Math.PI*2;
+  var spd = 8 + Math.random()*20;
+  debrisList.push({
+    x:x, y:y,
+    vx: Math.cos(ang)*spd, vy: Math.sin(ang)*spd,
+    mass:t.mass, r:t.r, color:t.color, value:t.value, key:t.key
+  });
+}
+
+for (var i=0;i<INITIAL_DEBRIS;i++) spawnDebris();
+
+function dist(x1,y1,x2,y2){
+  var dx=x1-x2, dy=y1-y2;
+  return Math.sqrt(dx*dx+dy*dy);
+}
+
+function effMass(){
+  var m = PLAYER_MASS;
+  for (var i=0;i<held.length;i++) m += held[i].mass;
+  return m;
+}
+
+function aimAngle(){
+  return Math.atan2(mouse.y - player.y, mouse.x - player.x);
+}
+
+function throwHeld(){
+  if (held.length === 0) return;
+  var item = held.shift();
+  var massAfter = effMass(); // held already shifted, so this excludes item
+  var vx = player.vx, vy = player.vy;
+  var ang = aimAngle();
+  var dx = Math.cos(ang), dy = Math.sin(ang);
+  var J = THROW_IMPULSE;
+
+  item.vx = vx + (J/item.mass)*dx;
+  item.vy = vy + (J/item.mass)*dy;
+  item.x = player.x + dx*(PLAYER_R+item.r+2);
+  item.y = player.y + dy*(PLAYER_R+item.r+2);
+  debrisList.push(item);
+
+  player.vx = vx - (J/massAfter)*dx;
+  player.vy = vy - (J/massAfter)*dy;
+}
+
+function showToast(text){
+  toast.text = text;
+  toast.t = 3.0;
+}
+
+function checkUnlocks(){
+  if (!unlocks.cap2 && score >= UNLOCK_CAP2){
+    unlocks.cap2 = true; capacity = 2;
+    showToast('解放: 貨物スロット+1 (容量2)');
+  }
+  if (!unlocks.thruster && score >= UNLOCK_THRUSTER){
+    unlocks.thruster = true; fuel = FUEL_MAX;
+    showToast('解放: スラスタ (Cキー)');
+  }
+  if (!unlocks.magnet && score >= UNLOCK_MAGNET){
+    unlocks.magnet = true;
+    showToast('解放: マグネット回収');
+  }
+}
+
+function update(dt){
+  // スラスタ: 解放前は弱い姿勢制御(燃料消費なし)、解放後は強力(燃料を消費)
+  if (keys.c){
+    var ang = aimAngle();
+    var accel = (unlocks.thruster && fuel > 0) ? THRUSTER_ACCEL : BASE_RCS_ACCEL;
+    player.vx += Math.cos(ang)*accel*dt;
+    player.vy += Math.sin(ang)*accel*dt;
+    if (unlocks.thruster && fuel > 0) fuel = Math.max(0, fuel - FUEL_DRAIN*dt);
+  } else if (unlocks.thruster) {
+    fuel = Math.min(FUEL_MAX, fuel + FUEL_REGEN*dt);
+  }
+
+  // マグネット: 一番近い浮遊デブリを引く
+  if (unlocks.magnet){
+    var nearest = null, nd = MAGNET_RADIUS;
+    for (var i=0;i<debrisList.length;i++){
+      var d = dist(debrisList[i].x,debrisList[i].y,player.x,player.y);
+      if (d < nd){ nd = d; nearest = debrisList[i]; }
+    }
+    if (nearest){
+      var pdx = player.x - nearest.x, pdy = player.y - nearest.y;
+      var pd = Math.sqrt(pdx*pdx+pdy*pdy) || 1;
+      nearest.vx += (pdx/pd)*MAGNET_ACCEL*dt;
+      nearest.vy += (pdy/pd)*MAGNET_ACCEL*dt;
+    }
+  }
+
+  // 積分: プレイヤー
+  player.x += player.vx*dt;
+  player.y += player.vy*dt;
+
+  // 積分: デブリ
+  for (var i=0;i<debrisList.length;i++){
+    debrisList[i].x += debrisList[i].vx*dt;
+    debrisList[i].y += debrisList[i].vy*dt;
+  }
+
+  // 外周反射: プレイヤー
+  if (player.x - PLAYER_R < WALL_X && !(player.y+PLAYER_R>AIRLOCK_Y0 && player.y-PLAYER_R<AIRLOCK_Y1)){
+    // station wall (non-airlock) はこの下で処理
+  }
+  if (player.x + PLAYER_R > W){ player.x = W-PLAYER_R; player.vx = -player.vx*WALL_REST; }
+  if (player.y - PLAYER_R < 0){ player.y = PLAYER_R; player.vy = -player.vy*WALL_REST; }
+  if (player.y + PLAYER_R > H){ player.y = H-PLAYER_R; player.vy = -player.vy*WALL_REST; }
+
+  // ステーション船体 / エアロック
+  if (player.x - PLAYER_R < WALL_X){
+    var inGap = (player.y > AIRLOCK_Y0 && player.y < AIRLOCK_Y1);
+    if (inGap && held.length > 0){
+      var gained = 0;
+      for (var i=0;i<held.length;i++) gained += held[i].value;
+      score += gained;
+      held = [];
+      checkUnlocks();
+    }
+    player.x = WALL_X + PLAYER_R;
+    player.vx = 0; player.vy = 0;
+  }
+
+  // 外周反射 + 船体反射: デブリ
+  for (var i=0;i<debrisList.length;i++){
+    var d = debrisList[i];
+    if (d.x - d.r < WALL_X){ d.x = WALL_X + d.r; d.vx = -d.vx*WALL_REST; }
+    if (d.x + d.r > W){ d.x = W-d.r; d.vx = -d.vx*WALL_REST; }
+    if (d.y - d.r < 0){ d.y = d.r; d.vy = -d.vy*WALL_REST; }
+    if (d.y + d.r > H){ d.y = H-d.r; d.vy = -d.vy*WALL_REST; }
+  }
+
+  // 回収 (非弾性合体)
+  if (held.length < capacity){
+    for (var i=debrisList.length-1;i>=0;i--){
+      var d = debrisList[i];
+      if (dist(player.x,player.y,d.x,d.y) <= PLAYER_R + d.r){
+        var m0 = effMass();
+        var nvx = (m0*player.vx + d.mass*d.vx)/(m0+d.mass);
+        var nvy = (m0*player.vy + d.mass*d.vy)/(m0+d.mass);
+        player.vx = nvx; player.vy = nvy;
+        held.push({mass:d.mass, r:d.r, color:d.color, value:d.value, key:d.key});
+        debrisList.splice(i,1);
+        if (held.length >= capacity) break;
+      }
+    }
+  }
+
+  // 補充
+  spawnTimer -= dt;
+  if (spawnTimer <= 0 && debrisList.length < MAX_DEBRIS){
+    spawnDebris();
+    spawnTimer = SPAWN_INTERVAL * (0.7 + Math.random()*0.6);
+  }
+
+  if (toast.t > 0) toast.t -= dt;
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+
+  // 星
+  ctx.fillStyle = '#1b2436';
+  for (var i=0;i<stars.length;i++){
+    ctx.beginPath();
+    ctx.arc(stars[i].x, stars[i].y, stars[i].r, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // ステーション船体
+  ctx.fillStyle = '#3a4a63';
+  ctx.fillRect(0,0,WALL_X,AIRLOCK_Y0);
+  ctx.fillRect(0,AIRLOCK_Y1,WALL_X,H-AIRLOCK_Y1);
+  ctx.fillStyle = unlocks.cap2 ? '#4fe08f' : '#2f8f5f';
+  ctx.fillRect(0,AIRLOCK_Y0,WALL_X,AIRLOCK_Y1-AIRLOCK_Y0);
+  ctx.strokeStyle = '#86f0b8';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(2,AIRLOCK_Y0+2,WALL_X-4,AIRLOCK_Y1-AIRLOCK_Y0-4);
+
+  // デブリ
+  for (var i=0;i<debrisList.length;i++){
+    var d = debrisList[i];
+    ctx.beginPath();
+    ctx.fillStyle = d.color;
+    ctx.arc(d.x,d.y,d.r,0,Math.PI*2);
+    ctx.fill();
+  }
+
+  // 照準線
+  var ang = aimAngle();
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.setLineDash([4,6]);
+  ctx.beginPath();
+  ctx.moveTo(player.x,player.y);
+  ctx.lineTo(player.x+Math.cos(ang)*600, player.y+Math.sin(ang)*600);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // プレイヤー
+  ctx.beginPath();
+  ctx.fillStyle = '#eef3ff';
+  ctx.arc(player.x,player.y,PLAYER_R,0,Math.PI*2);
+  ctx.fill();
+  if (keys.c){
+    ctx.beginPath();
+    ctx.fillStyle = '#ffb347';
+    ctx.arc(player.x-Math.cos(ang)*(PLAYER_R+6), player.y-Math.sin(ang)*(PLAYER_R+6), 5, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // 保持中デブリ(プレイヤー脇に表示)
+  for (var i=0;i<held.length;i++){
+    var h = held[i];
+    ctx.beginPath();
+    ctx.fillStyle = h.color;
+    ctx.arc(player.x - PLAYER_R - 4 - i*12, player.y - PLAYER_R - 4, 6, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // HUD
+  ctx.fillStyle = '#eef3ff';
+  ctx.font = '16px monospace';
+  ctx.fillText('SCORE: ' + score, 12, 24);
+  ctx.fillText('貨物: ' + held.length + '/' + capacity, 12, 46);
+
+  if (unlocks.thruster){
+    ctx.strokeStyle = '#7f93b0';
+    ctx.strokeRect(12, H-28, 120, 12);
+    ctx.fillStyle = '#ffb347';
+    ctx.fillRect(12, H-28, 120*(fuel/FUEL_MAX), 12);
+    ctx.fillStyle = '#7f93b0';
+    ctx.font = '11px monospace';
+    ctx.fillText('FUEL', 138, H-19);
+  }
+
+  var skillText = [];
+  if (unlocks.cap2) skillText.push('容量2');
+  if (unlocks.thruster) skillText.push('スラスタ');
+  if (unlocks.magnet) skillText.push('マグネット');
+  ctx.font = '12px monospace';
+  ctx.fillStyle = '#7f93b0';
+  ctx.fillText('解放済: ' + (skillText.length? skillText.join(' / ') : 'なし'), 12, 66);
+
+  if (toast.t > 0){
+    ctx.globalAlpha = Math.min(1, toast.t);
+    ctx.fillStyle = '#ffe98f';
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(toast.text, W/2, 40);
+    ctx.textAlign = 'left';
+    ctx.globalAlpha = 1;
+  }
+}
+
+var lastT = null;
+function frame(now){
+  if (lastT === null) lastT = now;
+  var dt = Math.min(0.05, (now - lastT)/1000);
+  lastT = now;
+  update(dt);
+  draw();
+  window.__debug = {
+    score: score,
+    held: held.length,
+    capacity: capacity,
+    unlocks: {cap2:unlocks.cap2, thruster:unlocks.thruster, magnet:unlocks.magnet},
+    debrisCount: debrisList.length,
+    fuel: fuel,
+    player: {x:player.x, y:player.y, vx:player.vx, vy:player.vy}
+  };
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// テスト用フック: 実ブラウザ入力の検証とは別に、物理ロジックを決定的に検証できるようにする
+window.__test = {
+  setAim: function(x,y){ mouse.x = x; mouse.y = y; },
+  setThrust: function(on){ keys.c = !!on; },
+  throwHeld: throwHeld,
+  forceScore: function(n){ score = n; checkUnlocks(); }
+};
+
+canvas.addEventListener('mousemove', function(e){
+  var rect = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - rect.left;
+  mouse.y = e.clientY - rect.top;
+});
+
+window.addEventListener('keydown', function(e){
+  if (e.code === 'Space'){ e.preventDefault(); throwHeld(); }
+  if (e.code === 'KeyC'){ keys.c = true; }
+});
+window.addEventListener('keyup', function(e){
+  if (e.code === 'KeyC'){ keys.c = false; }
+});
+
+})();
+</script>
+</body>
+</html>
